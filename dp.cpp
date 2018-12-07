@@ -1,9 +1,11 @@
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -21,8 +23,8 @@ enum Event {
   YieldToRightPeer,
   LeftPeerYielded,
   RightPeerYielded,
-  ReportWhenDone,
-  Done,
+  ReportWhenNotHungry,
+  NotHungry,
   Stop
 };
 
@@ -83,12 +85,6 @@ private:
 };
 
 class Philosopher {
-  enum State {
-    Initial,
-    Working,
-    Finishing,
-    WaitingForStop
-  };
 public:
   Philosopher():
     eventQueue_(),
@@ -97,9 +93,9 @@ public:
     leftPeer_(false),
     mainEventQueue_(nullptr),
     nEatenMeals_(0),
+    needToReportNotHungry_(false),
     nPostponedMeals_(0),
     rightPeer_(true),
-    state_(Initial),
     workerThread_(Work, ref(*this)) {}
   void dump(ostream& os) const {
     os << " idx:" << idx_ << " nPostponedMeals:" << nPostponedMeals_ <<
@@ -107,6 +103,7 @@ public:
   }
   void init(int idx, const Philosopher *peers, EventQueue& mainEventQueue);
   void join() { workerThread_.join(); }
+  int nEatenMeals() const { return nEatenMeals_; }
   void postEvent(Event event) { eventQueue_.postEvent(event); }
   Event getEvent() { return eventQueue_.getEvent(); }
   static void Work(Philosopher& philosopher) { philosopher.work(); }
@@ -120,9 +117,8 @@ private:
   void handlePeerYielded(Peer& yieldedPeer, Peer& otherPeer,
     Event otherPeerYieldEvent);
   bool hungry() const { return !!nPostponedMeals_; }
-  bool isDone() const { return !hungry() && !greaterPeerIsHungry_; }
   bool lessThanPeer(const Peer& peer) { return idx_ < peer.idx(); }
-  void reportDone();
+  void reportNotHungry();
   void resetGreaterPeerIsHungry();
   void yieldIfNeeded(Peer &peer, Event yieldedEvent);
   void yieldToGreaterPeerIfNeeded();
@@ -133,9 +129,9 @@ private:
   Peer leftPeer_;
   EventQueue* mainEventQueue_;
   int nEatenMeals_;
+  bool needToReportNotHungry_;
   int nPostponedMeals_;
   Peer rightPeer_;
-  State state_;
   thread workerThread_;
 };
 
@@ -147,25 +143,28 @@ operator<<(ostream& os, const Philosopher& p)
 }
 
 int
-main(int, char*[])
+main(int argc, char *argv[])
 {
   EventQueue mainEventQueue;
   Philosopher philosophers[N_PHILOSOPHERS];
   for (int i = 0;  i < N_PHILOSOPHERS;  ++i)
     philosophers[i].init(i, philosophers, mainEventQueue);
 
-  for(int nTestsLeft = 1000 * 1000;  --nTestsLeft;) {
+  constexpr int TOTAL_N_MEALS_DFLT = 1000 * 1000;
+  const int TOTAL_N_MEALS = argc == 1 ? TOTAL_N_MEALS_DFLT : atoi(argv[1]);
+
+  for(int nTestsLeft = TOTAL_N_MEALS;  nTestsLeft--;) {
     const int idx = rand() % N_PHILOSOPHERS;
     Philosopher& philosopher = philosophers[idx];
     philosopher.postEvent(GetHungry);
   }
 
   for(auto& philosopher: philosophers)
-    philosopher.postEvent(ReportWhenDone);
+    philosopher.postEvent(ReportWhenNotHungry);
 
   for(int nToReport = N_PHILOSOPHERS;  nToReport > 0;  --nToReport) {
-    Event e = mainEventQueue.getEvent();  // wait for all to get done
-    assert(e == Done);
+    Event e = mainEventQueue.getEvent();  // wait for all to get not hungry
+    assert(e == NotHungry);
   }
 
   for(auto& philosopher: philosophers)
@@ -176,6 +175,14 @@ main(int, char*[])
 
   for(auto& philosopher: philosophers) // print philosophers
    cout << philosopher << endl;
+
+  const int nEatenMeals = accumulate(begin(philosophers), end(philosophers), 0,
+    [](int a, const Philosopher& p) { return a + p.nEatenMeals(); });
+
+  cout << "TOTAL_N_MEALS:" << TOTAL_N_MEALS << " nEatenMeals:" << nEatenMeals <<
+    endl;
+
+
   return 0;
 }
 
@@ -197,8 +204,10 @@ Philosopher::eatPostponedMeals()
   assert(!!nPostponedMeals_);
   nEatenMeals_ += nPostponedMeals_;
   nPostponedMeals_ = 0;
-  if (state_ == Finishing && !greaterPeerIsHungry_)
-    reportDone();
+  if(needToReportNotHungry_) {
+    reportNotHungry();
+    needToReportNotHungry_ = false;
+  }
 }
 
 void
@@ -234,14 +243,12 @@ Philosopher::handlePeerYielded(Peer& yieldedPeer, Peer& otherPeer,
 void
 Philosopher::init(int idx, const Philosopher *peers, EventQueue& mainEventQueue)
 {
-  assert(state_ == Initial);
   assert(idx >= 0);
   assert(idx <= MAX_IDX);
   idx_ = idx;
   leftPeer_.init(peers[idx == 0 ? MAX_IDX : idx - 1].eventQueue(), idx);
   rightPeer_.init(peers[idx == MAX_IDX ? 0 : idx + 1].eventQueue(), idx);
   mainEventQueue_ = &mainEventQueue;
-  state_ = Working;
 }
 
 void
@@ -249,11 +256,6 @@ Philosopher::work()
 {
   for(Event event = getEvent();  ;  event = getEvent()) {
     assert(event != NoEvent);
-    switch(state_) {
-    case Initial:
-      assert(false);
-      break;
-    case Working:
       switch(event) {
       case GetHungry:
         if (askPeerToYieldIfNeeded(leftPeer_, YieldToRightPeer) ||
@@ -280,59 +282,30 @@ Philosopher::work()
       case RightPeerYielded:
         handlePeerYielded(rightPeer_, leftPeer_, YieldToRightPeer);
         break;
-      case ReportWhenDone:
-        if(isDone())
-          reportDone();
+      case ReportWhenNotHungry:
+        if(!hungry())
+          reportNotHungry();
         else
-          state_ = Finishing;
+          needToReportNotHungry_ = true;
         break;
+      case Stop:
+        return;
       default:
         assert(false);
       }
-      break;
-    case Finishing:
-      switch(event) {
-        case YieldToLeftPeer:
-          yieldIfNeeded(leftPeer_, RightPeerYielded);
-          break;
-        case YieldToRightPeer:
-          yieldIfNeeded(rightPeer_, LeftPeerYielded);
-          break;
-        case LeftPeerYielded:
-          handlePeerYielded(leftPeer_, rightPeer_, YieldToLeftPeer);
-          break;
-        case RightPeerYielded:
-          handlePeerYielded(rightPeer_, leftPeer_, YieldToRightPeer);
-          break;
-        default:
-          assert(false);
-      }
-      break;
-    case WaitingForStop:
-      if (event != Stop) {
-        this_thread::sleep_for(seconds(idx_ + 1));
-        cout << *this << ": ERROR: WaitingForStop, event is not Stop:" << event
-          << endl;
-      }
-      assert(event == Stop);
-      return;
-    }
   }
 }
 
 void
-Philosopher::reportDone()
+Philosopher::reportNotHungry()
 {
-    mainEventQueue_->postEvent(Done);
-    state_ = WaitingForStop;
+    mainEventQueue_->postEvent(NotHungry);
 }
 
 void
 Philosopher::resetGreaterPeerIsHungry()
 {
   greaterPeerIsHungry_ = false;
-  if(state_ == Finishing && !hungry())
-    reportDone();
 }
 
 void
