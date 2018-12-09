@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <functional>
@@ -11,7 +10,6 @@
 #include <thread>
 
 using namespace std;
-using namespace std::chrono;
 
 static constexpr int N_PHILOSOPHERS = 5;
 static constexpr int MAX_IDX = N_PHILOSOPHERS - 1;
@@ -267,8 +265,8 @@ Philosopher::work()
           ++nPostponedMeals_;
           break;
         }
+        assert(!greaterPeerIsHungry_);
         eatTheOnlyMeal();
-        yieldToGreaterPeerIfNeeded();
         break;
       case YieldToLeftPeer:
         yieldIfNeeded(leftPeer_, RightPeerYielded);
